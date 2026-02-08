@@ -28,6 +28,7 @@ async function handleSocketSession(serverSocket, env, exitPort) {
   let reader = null;
   let closed = false;
   let writeQueue = Promise.resolve();
+  let upstreamReaderStarted = false;
 
   const closeAll = async (code = 1000, reason = "normal") => {
     if (closed) {
@@ -77,6 +78,31 @@ async function handleSocketSession(serverSocket, env, exitPort) {
     await writer.write(encoder.encode(`AUTH ${env.AUTH_SECRET_KEY}\n`));
   })();
 
+  const startUpstreamReader = () => {
+    if (upstreamReaderStarted) {
+      return;
+    }
+    upstreamReaderStarted = true;
+
+    (async () => {
+      try {
+        await upstreamReady;
+        while (!closed) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (value && value.byteLength > 0) {
+            serverSocket.send(value);
+          }
+        }
+        await closeAll(1000, "upstream-closed");
+      } catch {
+        await closeAll(1011, "upstream-read-failed");
+      }
+    })();
+  };
+
   serverSocket.addEventListener("message", (event) => {
     if (closed) {
       return;
@@ -85,6 +111,7 @@ async function handleSocketSession(serverSocket, env, exitPort) {
     writeQueue = writeQueue
       .then(async () => {
         await upstreamReady;
+        startUpstreamReader();
         const bytes = await toBytes(event.data);
         if (!bytes || bytes.length === 0 || closed) {
           return;
@@ -103,24 +130,6 @@ async function handleSocketSession(serverSocket, env, exitPort) {
   serverSocket.addEventListener("error", () => {
     void closeAll(1011, "websocket-error");
   });
-
-  (async () => {
-    try {
-      await upstreamReady;
-      while (!closed) {
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-        if (value && value.byteLength > 0) {
-          serverSocket.send(value);
-        }
-      }
-      await closeAll(1000, "upstream-closed");
-    } catch {
-      await closeAll(1011, "upstream-read-failed");
-    }
-  })();
 }
 
 export default {
