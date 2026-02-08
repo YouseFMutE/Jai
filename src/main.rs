@@ -25,6 +25,7 @@ const AUTH_HEADER_NAME: &str = "auth-secret-key";
 const PROFILE_HEADER_NAME: &str = "x-traffic-profile";
 const EDGE_INITIAL_SEGMENT_BYTES: usize = 300;
 const EDGE_INITIAL_SEGMENT_CHUNK: usize = 3;
+const EDGE_CONNECT_RETRIES: u32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -386,7 +387,7 @@ async fn handle_bridge_client(
     let generation_id = lease.generation.id;
     let generation = Arc::clone(&lease.generation);
 
-    let ws_stream = connect_bridge_websocket(&state)
+    let ws_stream = connect_bridge_websocket_with_retry(&state, EDGE_CONNECT_RETRIES)
         .await
         .with_context(|| format!("generation {} failed to connect to edge", generation_id))?;
 
@@ -467,6 +468,28 @@ async fn connect_bridge_websocket(
         .await
         .context("websocket upgrade to edge failed")?;
     Ok(ws_stream)
+}
+
+async fn connect_bridge_websocket_with_retry(
+    state: &BridgeState,
+    attempts: u32,
+) -> Result<WebSocketStream<tokio_rustls::client::TlsStream<InitialChunkedTcpStream>>> {
+    let max_attempts = attempts.max(1);
+    let mut last_error = None;
+
+    for attempt in 1..=max_attempts {
+        match connect_bridge_websocket(state).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < max_attempts {
+                    sleep(Duration::from_millis(150 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("at least one connection attempt should have failed"))
 }
 
 async fn handle_destination_client(socket: TcpStream, args: DestinationArgs) -> Result<()> {

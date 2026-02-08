@@ -2,7 +2,7 @@ import { connect } from "cloudflare:sockets";
 
 const encoder = new TextEncoder();
 
-function toBytes(data) {
+async function toBytes(data) {
   if (data instanceof Uint8Array) {
     return data;
   }
@@ -13,9 +13,114 @@ function toBytes(data) {
     return encoder.encode(data);
   }
   if (data && typeof data.arrayBuffer === "function") {
-    return data.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+    const buffer = await data.arrayBuffer();
+    return new Uint8Array(buffer);
   }
   return null;
+}
+
+async function handleSocketSession(serverSocket, env, exitPort) {
+  const secureTransport =
+    (env.EXIT_NODE_SCHEME || "ws").toLowerCase() === "wss" ? "on" : "off";
+
+  let socket = null;
+  let writer = null;
+  let reader = null;
+  let closed = false;
+  let writeQueue = Promise.resolve();
+
+  const closeAll = async (code = 1000, reason = "normal") => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+
+    try {
+      await writeQueue;
+    } catch {}
+
+    try {
+      if (writer) {
+        await writer.close();
+      }
+    } catch {}
+
+    try {
+      writer?.releaseLock();
+    } catch {}
+
+    try {
+      reader?.releaseLock();
+    } catch {}
+
+    try {
+      socket?.close();
+    } catch {}
+
+    try {
+      serverSocket.close(code, reason);
+    } catch {}
+  };
+
+  const upstreamReady = (async () => {
+    socket = connect(
+      {
+        hostname: env.EXIT_NODE_HOST,
+        port: exitPort,
+      },
+      { secureTransport }
+    );
+
+    writer = socket.writable.getWriter();
+    reader = socket.readable.getReader();
+
+    await writer.write(encoder.encode(`AUTH ${env.AUTH_SECRET_KEY}\n`));
+  })();
+
+  serverSocket.addEventListener("message", (event) => {
+    if (closed) {
+      return;
+    }
+
+    writeQueue = writeQueue
+      .then(async () => {
+        await upstreamReady;
+        const bytes = await toBytes(event.data);
+        if (!bytes || bytes.length === 0 || closed) {
+          return;
+        }
+        await writer.write(bytes);
+      })
+      .catch(async () => {
+        await closeAll(1011, "upstream-write-failed");
+      });
+  });
+
+  serverSocket.addEventListener("close", () => {
+    void closeAll(1000, "client-closed");
+  });
+
+  serverSocket.addEventListener("error", () => {
+    void closeAll(1011, "websocket-error");
+  });
+
+  (async () => {
+    try {
+      await upstreamReady;
+      while (!closed) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value && value.byteLength > 0) {
+          serverSocket.send(value);
+        }
+      }
+      await closeAll(1000, "upstream-closed");
+    } catch {
+      await closeAll(1011, "upstream-read-failed");
+    }
+  })();
 }
 
 export default {
@@ -43,117 +148,12 @@ export default {
       return new Response("EXIT_NODE_PORT is invalid", { status: 500 });
     }
 
-    const secureTransport =
-      (env.EXIT_NODE_SCHEME || "ws").toLowerCase() === "wss" ? "on" : "off";
-
-    let socket;
-    try {
-      socket = connect(
-        {
-          hostname: env.EXIT_NODE_HOST,
-          port: exitPort,
-        },
-        { secureTransport }
-      );
-    } catch {
-      return new Response("Failed to open upstream socket", { status: 502 });
-    }
-
-    const writer = socket.writable.getWriter();
-    const reader = socket.readable.getReader();
-
-    try {
-      await writer.write(encoder.encode(`AUTH ${env.AUTH_SECRET_KEY}\n`));
-    } catch {
-      try {
-        writer.releaseLock();
-      } catch {}
-      try {
-        reader.releaseLock();
-      } catch {}
-      try {
-        socket.close();
-      } catch {}
-      return new Response("Upstream authentication failed", { status: 502 });
-    }
-
     const webSocketPair = new WebSocketPair();
     const clientSocket = webSocketPair[0];
     const serverSocket = webSocketPair[1];
     serverSocket.accept();
 
-    let closed = false;
-    let writeQueue = Promise.resolve();
-
-    const closeAll = async (code = 1000, reason = "normal") => {
-      if (closed) {
-        return;
-      }
-      closed = true;
-
-      try {
-        await writeQueue;
-      } catch {}
-      try {
-        await writer.close();
-      } catch {}
-      try {
-        writer.releaseLock();
-      } catch {}
-      try {
-        reader.releaseLock();
-      } catch {}
-      try {
-        socket.close();
-      } catch {}
-      try {
-        serverSocket.close(code, reason);
-      } catch {}
-    };
-
-    serverSocket.addEventListener("message", (event) => {
-      if (closed) {
-        return;
-      }
-      writeQueue = writeQueue
-        .then(async () => {
-          const maybeBytes = toBytes(event.data);
-          const bytes =
-            maybeBytes instanceof Promise ? await maybeBytes : maybeBytes;
-          if (!bytes || bytes.length === 0) {
-            return;
-          }
-          await writer.write(bytes);
-        })
-        .catch(async () => {
-          await closeAll(1011, "upstream-write-failed");
-        });
-    });
-
-    serverSocket.addEventListener("close", () => {
-      void closeAll(1000, "client-closed");
-    });
-
-    serverSocket.addEventListener("error", () => {
-      void closeAll(1011, "websocket-error");
-    });
-
-    (async () => {
-      try {
-        while (!closed) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
-          }
-          if (value && value.byteLength > 0) {
-            serverSocket.send(value);
-          }
-        }
-        await closeAll(1000, "upstream-closed");
-      } catch {
-        await closeAll(1011, "upstream-read-failed");
-      }
-    })();
+    void handleSocketSession(serverSocket, env, exitPort);
 
     return new Response(null, {
       status: 101,
