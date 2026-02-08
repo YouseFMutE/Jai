@@ -780,10 +780,10 @@ fn build_tls_connector(profile: TrafficProfile) -> Result<TlsConnector> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.enable_sni = true;
-    config.alpn_protocols = match profile {
-        TrafficProfile::Chrome => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        TrafficProfile::Firefox => vec![b"http/1.1".to_vec(), b"h2".to_vec()],
-    };
+    // WebSocket upgrade here is HTTP/1.1-based; advertising h2 can make
+    // Cloudflare select HTTP/2, which breaks tungstenite's HTTP/1.1 parser.
+    let _profile_marker = profile;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(TlsConnector::from(Arc::new(config)))
 }
