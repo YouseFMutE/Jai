@@ -36,7 +36,7 @@ install_dependencies() {
   case "${pm}" in
     apt)
       ${SUDO} apt-get update
-      ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      ${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get install -y \
         build-essential whiptail pkg-config libssl-dev curl ca-certificates
       ;;
     dnf)
