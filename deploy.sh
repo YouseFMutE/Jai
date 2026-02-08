@@ -164,7 +164,7 @@ write_environment_file() {
 write_service_file() {
   local exec_args
   if [[ "${ROLE}" == "IRAN_BRIDGE" ]]; then
-    exec_args="bridge --listen 127.0.0.1:${TARGET_PORT} --edge-addr ${CLEAN_ANYCAST_IP}:443 --host ${CUSTOM_DOMAIN} --sni ${CUSTOM_DOMAIN} --path /relay"
+    exec_args="bridge --listen 0.0.0.0:${TARGET_PORT} --edge-addr ${CLEAN_ANYCAST_IP}:443 --host ${CUSTOM_DOMAIN} --sni ${CUSTOM_DOMAIN} --path /relay"
   else
     exec_args="destination --listen ${DEFAULT_EXIT_LISTEN} --forward 127.0.0.1:${TARGET_PORT}"
   fi
