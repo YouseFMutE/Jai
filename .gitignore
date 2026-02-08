@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# Cargo lockfile policy:
+# keep Cargo.lock for binaries; ignore if you prefer library-style workflow
+# /Cargo.lock
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Local editor/system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
