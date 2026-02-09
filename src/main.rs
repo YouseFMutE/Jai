@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
-use std::{io, task::{Context as TaskContext, Poll}};
+use std::{
+    io,
+    task::{Context as TaskContext, Poll},
+};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -13,8 +16,8 @@ use rustls::pki_types::ServerName;
 use rustls::{version, ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -122,6 +125,8 @@ struct BridgeState {
     tls_connector: TlsConnector,
     rotation: Arc<RotationManager>,
     edge_connect_slots: Arc<Semaphore>,
+    edge_candidates: Arc<Vec<SocketAddr>>,
+    next_edge_index: AtomicU64,
 }
 
 struct RotationManager {
@@ -213,10 +218,7 @@ impl AsyncWrite for InitialChunkedTcpStream {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 
@@ -324,6 +326,7 @@ async fn main() -> Result<()> {
 async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
     let cycle_minutes = args.cycle_minutes.clamp(10, 15);
     let cycle_after = Duration::from_secs(cycle_minutes * 60);
+    let edge_candidates = Arc::new(resolve_edge_candidates(&args).await);
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("failed to bind bridge listener on {}", args.listen))?;
@@ -331,6 +334,8 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
         tls_connector: build_tls_connector(args.traffic_profile)?,
         rotation: Arc::new(RotationManager::new(cycle_after, args.cycle_bytes)),
         edge_connect_slots: Arc::new(Semaphore::new(args.max_concurrent_edge_connects.max(1))),
+        edge_candidates,
+        next_edge_index: AtomicU64::new(0),
         args,
     });
 
@@ -339,7 +344,7 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
     }
 
     println!(
-        "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes, edge-segment {}/{}B, max-edge-connects {})",
+        "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes, edge-segment {}/{}B, max-edge-connects {}, edge-candidates={})",
         state.args.listen,
         state.args.edge_addr,
         state.args.host,
@@ -347,7 +352,8 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
         state.args.cycle_bytes,
         state.args.edge_initial_segment_bytes,
         state.args.edge_initial_segment_chunk,
-        state.args.max_concurrent_edge_connects
+        state.args.max_concurrent_edge_connects,
+        state.edge_candidates.len()
     );
 
     loop {
@@ -406,7 +412,10 @@ async fn run_destination_mode(args: DestinationArgs) -> Result<()> {
         let args = args.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_destination_client(socket, args, peer).await {
-                eprintln!("destination session from {} closed with error: {err:#}", peer);
+                eprintln!(
+                    "destination session from {} closed with error: {err:#}",
+                    peer
+                );
             }
         });
     }
@@ -433,9 +442,13 @@ async fn handle_bridge_client(
         peer, generation_id
     );
 
-    let stats =
-        relay_tcp_over_ws(local_stream, ws_stream, Some(generation), state.chunking_config())
-            .await?;
+    let stats = relay_tcp_over_ws(
+        local_stream,
+        ws_stream,
+        Some(generation),
+        state.chunking_config(),
+    )
+    .await?;
     println!(
         "bridge session from {} finished: up={}B down={}B generation={}",
         peer, stats.up_bytes, stats.down_bytes, generation_id
@@ -454,7 +467,7 @@ impl BridgeState {
 }
 
 async fn warmup_generation(state: Arc<BridgeState>, generation_id: u64) -> Result<()> {
-    let mut ws = connect_bridge_websocket(&state)
+    let mut ws = connect_bridge_websocket_with_retry(&state, EDGE_CONNECT_RETRIES)
         .await
         .with_context(|| format!("generation {} warmup connect failed", generation_id))?;
     ws.close(None)
@@ -466,10 +479,12 @@ async fn warmup_generation(state: Arc<BridgeState>, generation_id: u64) -> Resul
 
 async fn connect_bridge_websocket(
     state: &BridgeState,
+    edge_addr: SocketAddr,
 ) -> Result<WebSocketStream<tokio_rustls::client::TlsStream<InitialChunkedTcpStream>>> {
-    let edge_stream = TcpStream::connect(state.args.edge_addr)
+    let edge_stream = timeout(Duration::from_secs(5), TcpStream::connect(edge_addr))
         .await
-        .with_context(|| format!("failed to connect edge {}", state.args.edge_addr))?;
+        .with_context(|| format!("timed out connecting edge {}", edge_addr))?
+        .with_context(|| format!("failed to connect edge {}", edge_addr))?;
     edge_stream
         .set_nodelay(true)
         .context("failed to set TCP_NODELAY on edge stream")?;
@@ -481,11 +496,13 @@ async fn connect_bridge_websocket(
         state.args.edge_initial_segment_bytes,
         state.args.edge_initial_segment_chunk,
     );
-    let tls_stream = state
-        .tls_connector
-        .connect(server_name, edge_stream)
-        .await
-        .context("TLS handshake to edge failed")?;
+    let tls_stream = timeout(
+        Duration::from_secs(8),
+        state.tls_connector.connect(server_name, edge_stream),
+    )
+    .await
+    .context("TLS handshake to edge timed out")?
+    .context("TLS handshake to edge failed")?;
 
     let normalized_path = if state.args.path.starts_with('/') {
         state.args.path.clone()
@@ -513,8 +530,9 @@ async fn connect_bridge_websocket(
         }),
     );
 
-    let (ws_stream, _) = client_async(request, tls_stream)
+    let (ws_stream, _) = timeout(Duration::from_secs(8), client_async(request, tls_stream))
         .await
+        .context("websocket upgrade to edge timed out")?
         .context("websocket upgrade to edge failed")?;
     Ok(ws_stream)
 }
@@ -532,13 +550,18 @@ async fn connect_bridge_websocket_with_retry(
     let max_attempts = attempts.max(1);
     let mut last_error = None;
 
+    let candidate_count = state.edge_candidates.len().max(1);
+    let start_index = state.next_edge_index.fetch_add(1, Ordering::Relaxed) as usize;
+
     for attempt in 1..=max_attempts {
-        match connect_bridge_websocket(state).await {
+        let idx = (start_index + attempt as usize - 1) % candidate_count;
+        let edge_addr = state.edge_candidates[idx];
+        match connect_bridge_websocket(state, edge_addr).await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
                 eprintln!(
-                    "bridge edge connect attempt {}/{} failed: {err:#}",
-                    attempt, max_attempts
+                    "bridge edge connect attempt {}/{} via {} failed: {err:#}",
+                    attempt, max_attempts, edge_addr
                 );
                 last_error = Some(err);
                 if attempt < max_attempts {
@@ -602,13 +625,8 @@ async fn handle_destination_websocket(
         peer, args.forward
     );
 
-    let stats = relay_tcp_over_ws(
-        target_stream,
-        ws_stream,
-        None,
-        ChunkingConfig::disabled(),
-    )
-    .await?;
+    let stats =
+        relay_tcp_over_ws(target_stream, ws_stream, None, ChunkingConfig::disabled()).await?;
     println!(
         "destination websocket session from {} finished: up={}B down={}B",
         peer, stats.up_bytes, stats.down_bytes
@@ -624,7 +642,10 @@ async fn handle_destination_raw(
     let auth_line = read_auth_line(&mut inbound, 512).await?;
     let expected = format!("AUTH {}", args.auth_secret_key);
     if auth_line.trim_end_matches(['\r', '\n']) != expected {
-        eprintln!("destination raw session from {} failed authentication", peer);
+        eprintln!(
+            "destination raw session from {} failed authentication",
+            peer
+        );
         return Err(anyhow!("unauthorized raw destination connection"));
     }
     println!("destination raw session from {} authenticated", peer);
@@ -792,6 +813,24 @@ where
     })
 }
 
+async fn resolve_edge_candidates(args: &BridgeArgs) -> Vec<SocketAddr> {
+    let mut candidates = vec![args.edge_addr];
+    let host_port = (args.host.as_str(), args.edge_addr.port());
+
+    if let Ok(resolved) = timeout(Duration::from_secs(3), tokio::net::lookup_host(host_port)).await
+    {
+        if let Ok(addresses) = resolved {
+            for addr in addresses {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
 async fn send_binary_with_chunking<W>(
     ws_writer: &mut W,
     data: &[u8],
@@ -882,10 +921,7 @@ async fn start_health_server(mode: &'static str, listen: SocketAddr) -> Result<(
                 Ok((mut socket, peer)) => {
                     tokio::spawn(async move {
                         if let Err(err) = handle_health_connection(&mut socket, mode).await {
-                            eprintln!(
-                                "{mode} health request from {} failed: {err:#}",
-                                peer
-                            );
+                            eprintln!("{mode} health request from {} failed: {err:#}", peer);
                         }
                     });
                 }
@@ -935,7 +971,10 @@ async fn handle_health_connection(socket: &mut TcpStream, mode: &str) -> Result<
                 mode
             ),
         ),
-        ("GET", _) => (StatusCode::NOT_FOUND, String::from("{\"error\":\"not found\"}")),
+        ("GET", _) => (
+            StatusCode::NOT_FOUND,
+            String::from("{\"error\":\"not found\"}"),
+        ),
         _ => (
             StatusCode::METHOD_NOT_ALLOWED,
             String::from("{\"error\":\"method not allowed\"}"),
