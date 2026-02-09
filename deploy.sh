@@ -9,6 +9,8 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 ENV_DIR="/etc/${BIN_NAME}"
 ENV_FILE="${ENV_DIR}/${BIN_NAME}.env"
 DEFAULT_EXIT_LISTEN="0.0.0.0:8443"
+DEFAULT_BRIDGE_HEALTH_LISTEN="127.0.0.1:19090"
+DEFAULT_EXIT_HEALTH_LISTEN="127.0.0.1:19091"
 
 if [[ "${EUID}" -eq 0 ]]; then
   SUDO=""
@@ -164,9 +166,9 @@ write_environment_file() {
 write_service_file() {
   local exec_args
   if [[ "${ROLE}" == "IRAN_BRIDGE" ]]; then
-    exec_args="bridge --listen 0.0.0.0:${TARGET_PORT} --edge-addr ${CLEAN_ANYCAST_IP}:443 --host ${CUSTOM_DOMAIN} --sni ${CUSTOM_DOMAIN} --path /relay"
+    exec_args="bridge --listen 0.0.0.0:${TARGET_PORT} --edge-addr ${CLEAN_ANYCAST_IP}:443 --host ${CUSTOM_DOMAIN} --sni ${CUSTOM_DOMAIN} --path /relay --health-listen ${DEFAULT_BRIDGE_HEALTH_LISTEN}"
   else
-    exec_args="destination --listen ${DEFAULT_EXIT_LISTEN} --forward 127.0.0.1:${TARGET_PORT}"
+    exec_args="destination --listen ${DEFAULT_EXIT_LISTEN} --forward 127.0.0.1:${TARGET_PORT} --health-listen ${DEFAULT_EXIT_HEALTH_LISTEN}"
   fi
 
   cat <<EOF | ${SUDO} tee "${SERVICE_FILE}" >/dev/null
@@ -196,6 +198,25 @@ enable_service() {
   ${SUDO} systemctl enable --now "${SERVICE_NAME}"
 }
 
+post_deploy_checks() {
+  local health_addr
+  if [[ "${ROLE}" == "IRAN_BRIDGE" ]]; then
+    health_addr="${DEFAULT_BRIDGE_HEALTH_LISTEN}"
+  else
+    health_addr="${DEFAULT_EXIT_HEALTH_LISTEN}"
+  fi
+
+  echo "== Service status =="
+  ${SUDO} systemctl --no-pager --full status "${SERVICE_NAME}" | sed -n '1,25p' || true
+  echo
+  echo "== ExecStart =="
+  ${SUDO} systemctl cat "${SERVICE_NAME}" | grep ExecStart || true
+  echo
+  echo "== Health check (${health_addr}) =="
+  curl -fsS "http://${health_addr}/healthz" || true
+  echo
+}
+
 main() {
   install_dependencies
   ensure_rust
@@ -204,6 +225,7 @@ main() {
   write_environment_file
   write_service_file
   enable_service
+  post_deploy_checks
 
   whiptail --title "Aegis Edge Relay" --msgbox \
     "Deployment completed.\nService: ${SERVICE_NAME}\nBinary: ${BIN_PATH}\nEnv: ${ENV_FILE}" \

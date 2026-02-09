@@ -2,6 +2,16 @@ import { connect } from "cloudflare:sockets";
 
 const encoder = new TextEncoder();
 
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
 async function toBytes(data) {
   if (data instanceof Uint8Array) {
     return data;
@@ -134,9 +144,44 @@ async function handleSocketSession(serverSocket, env, exitPort) {
 
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname || "/";
+
+    if (path === "/healthz") {
+      return jsonResponse({
+        status: "ok",
+        service: "aegis-edge-relay-worker",
+        hasAuthKey: Boolean(env.AUTH_SECRET_KEY),
+        hasExitHost: Boolean(env.EXIT_NODE_HOST),
+      });
+    }
+
+    if (path === "/readyz") {
+      const exitPort = Number(env.EXIT_NODE_PORT || "8443");
+      const validPort = Number.isInteger(exitPort) && exitPort >= 1 && exitPort <= 65535;
+      if (!env.AUTH_SECRET_KEY || !env.EXIT_NODE_HOST || !validPort) {
+        return jsonResponse(
+          {
+            status: "error",
+            message: "Worker env vars are incomplete or invalid",
+            required: ["AUTH_SECRET_KEY", "EXIT_NODE_HOST", "EXIT_NODE_PORT"],
+          },
+          503
+        );
+      }
+      return jsonResponse({
+        status: "ready",
+        exitHost: env.EXIT_NODE_HOST,
+        exitPort,
+      });
+    }
+
     const upgradeHeader = request.headers.get("Upgrade");
     if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
       return new Response("WebSocket upgrade required", { status: 426 });
+    }
+    if (path !== "/relay") {
+      return new Response("Not found", { status: 404 });
     }
 
     if (!env.AUTH_SECRET_KEY) {

@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 use std::{io, task::{Context as TaskContext, Poll}};
 
@@ -13,7 +14,7 @@ use rustls::{version, ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -76,6 +77,8 @@ struct BridgeArgs {
     initial_chunk_size: usize,
     #[arg(long, default_value_t = 2)]
     initial_chunk_delay_ms: u64,
+    #[arg(long)]
+    health_listen: Option<SocketAddr>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -86,6 +89,8 @@ struct DestinationArgs {
     forward: SocketAddr,
     #[arg(long, env = "AUTH_SECRET_KEY")]
     auth_secret_key: String,
+    #[arg(long)]
+    health_listen: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +138,12 @@ struct GenerationLease {
 struct AcquireOutcome {
     lease: GenerationLease,
     rotated_to: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RelayStats {
+    up_bytes: u64,
+    down_bytes: u64,
 }
 
 struct InitialChunkedTcpStream {
@@ -314,6 +325,10 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
         args,
     });
 
+    if let Some(health_addr) = state.args.health_listen {
+        start_health_server("bridge", health_addr).await?;
+    }
+
     println!(
         "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes)",
         state.args.listen,
@@ -344,7 +359,9 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
                 });
             }
 
-            if let Err(err) = handle_bridge_client(local_stream, state, acquisition.lease).await {
+            if let Err(err) =
+                handle_bridge_client(local_stream, state, acquisition.lease, peer).await
+            {
                 eprintln!("bridge session from {} closed with error: {err:#}", peer);
             }
         });
@@ -355,6 +372,10 @@ async fn run_destination_mode(args: DestinationArgs) -> Result<()> {
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("failed to bind destination listener on {}", args.listen))?;
+
+    if let Some(health_addr) = args.health_listen {
+        start_health_server("destination", health_addr).await?;
+    }
 
     println!(
         "Destination mode ready on {} -> forward {}",
@@ -372,7 +393,7 @@ async fn run_destination_mode(args: DestinationArgs) -> Result<()> {
 
         let args = args.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_destination_client(socket, args).await {
+            if let Err(err) = handle_destination_client(socket, args, peer).await {
                 eprintln!("destination session from {} closed with error: {err:#}", peer);
             }
         });
@@ -383,15 +404,31 @@ async fn handle_bridge_client(
     local_stream: TcpStream,
     state: Arc<BridgeState>,
     lease: GenerationLease,
+    peer: SocketAddr,
 ) -> Result<()> {
     let generation_id = lease.generation.id;
     let generation = Arc::clone(&lease.generation);
+    println!(
+        "bridge session from {} assigned to generation {}",
+        peer, generation_id
+    );
 
     let ws_stream = connect_bridge_websocket_with_retry(&state, EDGE_CONNECT_RETRIES)
         .await
         .with_context(|| format!("generation {} failed to connect to edge", generation_id))?;
+    println!(
+        "bridge session from {} connected to edge using generation {}",
+        peer, generation_id
+    );
 
-    relay_tcp_over_ws(local_stream, ws_stream, Some(generation), state.chunking_config()).await
+    let stats =
+        relay_tcp_over_ws(local_stream, ws_stream, Some(generation), state.chunking_config())
+            .await?;
+    println!(
+        "bridge session from {} finished: up={}B down={}B generation={}",
+        peer, stats.up_bytes, stats.down_bytes, generation_id
+    );
+    Ok(())
 }
 
 impl BridgeState {
@@ -481,6 +518,10 @@ async fn connect_bridge_websocket_with_retry(
         match connect_bridge_websocket(state).await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
+                eprintln!(
+                    "bridge edge connect attempt {}/{} failed: {err:#}",
+                    attempt, max_attempts
+                );
                 last_error = Some(err);
                 if attempt < max_attempts {
                     sleep(Duration::from_millis(150 * u64::from(attempt))).await;
@@ -492,20 +533,30 @@ async fn connect_bridge_websocket_with_retry(
     Err(last_error.expect("at least one connection attempt should have failed"))
 }
 
-async fn handle_destination_client(socket: TcpStream, args: DestinationArgs) -> Result<()> {
+async fn handle_destination_client(
+    socket: TcpStream,
+    args: DestinationArgs,
+    peer: SocketAddr,
+) -> Result<()> {
     let mut probe = [0u8; 3];
     let peeked = socket
         .peek(&mut probe)
         .await
         .context("failed to probe destination socket")?;
     if peeked >= 3 && &probe == b"GET" {
-        handle_destination_websocket(socket, args).await
+        println!("destination session from {} detected websocket mode", peer);
+        handle_destination_websocket(socket, args, peer).await
     } else {
-        handle_destination_raw(socket, args).await
+        println!("destination session from {} detected raw mode", peer);
+        handle_destination_raw(socket, args, peer).await
     }
 }
 
-async fn handle_destination_websocket(socket: TcpStream, args: DestinationArgs) -> Result<()> {
+async fn handle_destination_websocket(
+    socket: TcpStream,
+    args: DestinationArgs,
+    peer: SocketAddr,
+) -> Result<()> {
     let shared_secret = args.auth_secret_key.clone();
     let ws_stream = accept_hdr_async(socket, move |req: &Request, response: Response| {
         let incoming = req
@@ -520,6 +571,7 @@ async fn handle_destination_websocket(socket: TcpStream, args: DestinationArgs) 
     })
     .await
     .context("destination websocket handshake failed")?;
+    println!("destination websocket session from {} authenticated", peer);
 
     let target_stream = TcpStream::connect(args.forward)
         .await
@@ -527,22 +579,37 @@ async fn handle_destination_websocket(socket: TcpStream, args: DestinationArgs) 
     target_stream
         .set_nodelay(true)
         .context("failed to set TCP_NODELAY on forward stream")?;
+    println!(
+        "destination websocket session from {} connected forward target {}",
+        peer, args.forward
+    );
 
-    relay_tcp_over_ws(
+    let stats = relay_tcp_over_ws(
         target_stream,
         ws_stream,
         None,
         ChunkingConfig::disabled(),
     )
-    .await
+    .await?;
+    println!(
+        "destination websocket session from {} finished: up={}B down={}B",
+        peer, stats.up_bytes, stats.down_bytes
+    );
+    Ok(())
 }
 
-async fn handle_destination_raw(mut inbound: TcpStream, args: DestinationArgs) -> Result<()> {
+async fn handle_destination_raw(
+    mut inbound: TcpStream,
+    args: DestinationArgs,
+    peer: SocketAddr,
+) -> Result<()> {
     let auth_line = read_auth_line(&mut inbound, 512).await?;
     let expected = format!("AUTH {}", args.auth_secret_key);
     if auth_line.trim_end_matches(['\r', '\n']) != expected {
+        eprintln!("destination raw session from {} failed authentication", peer);
         return Err(anyhow!("unauthorized raw destination connection"));
     }
+    println!("destination raw session from {} authenticated", peer);
 
     let outbound = TcpStream::connect(args.forward)
         .await
@@ -550,8 +617,17 @@ async fn handle_destination_raw(mut inbound: TcpStream, args: DestinationArgs) -
     outbound
         .set_nodelay(true)
         .context("failed to set TCP_NODELAY on forward stream")?;
+    println!(
+        "destination raw session from {} connected forward target {}",
+        peer, args.forward
+    );
 
-    relay_tcp_over_tcp(inbound, outbound).await
+    let stats = relay_tcp_over_tcp(inbound, outbound).await?;
+    println!(
+        "destination raw session from {} finished: up={}B down={}B",
+        peer, stats.up_bytes, stats.down_bytes
+    );
+    Ok(())
 }
 
 async fn read_auth_line(stream: &mut TcpStream, max_len: usize) -> Result<String> {
@@ -584,44 +660,40 @@ fn unauthorized_response() -> ErrorResponse {
         .expect("failed to build static unauthorized response")
 }
 
-async fn relay_tcp_over_tcp(left: TcpStream, right: TcpStream) -> Result<()> {
+async fn relay_tcp_over_tcp(left: TcpStream, right: TcpStream) -> Result<RelayStats> {
     let (mut left_reader, mut left_writer) = left.into_split();
     let (mut right_reader, mut right_writer) = right.into_split();
 
-    let mut left_to_right = tokio::spawn(async move {
-        tokio::io::copy(&mut left_reader, &mut right_writer)
+    let left_to_right = tokio::spawn(async move {
+        let copied = tokio::io::copy(&mut left_reader, &mut right_writer)
             .await
             .context("raw relay left->right failed")?;
         right_writer
             .shutdown()
             .await
             .context("raw relay failed to shutdown right writer")?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<u64, anyhow::Error>(copied)
     });
 
-    let mut right_to_left = tokio::spawn(async move {
-        tokio::io::copy(&mut right_reader, &mut left_writer)
+    let right_to_left = tokio::spawn(async move {
+        let copied = tokio::io::copy(&mut right_reader, &mut left_writer)
             .await
             .context("raw relay right->left failed")?;
         left_writer
             .shutdown()
             .await
             .context("raw relay failed to shutdown left writer")?;
-        Ok::<(), anyhow::Error>(())
+        Ok::<u64, anyhow::Error>(copied)
     });
 
-    tokio::select! {
-        first = &mut left_to_right => {
-            right_to_left.abort();
-            first.context("raw relay left->right join failure")??;
-        }
-        second = &mut right_to_left => {
-            left_to_right.abort();
-            second.context("raw relay right->left join failure")??;
-        }
-    }
+    let (left_res, right_res) = tokio::join!(left_to_right, right_to_left);
+    let up_bytes = left_res.context("raw relay left->right join failure")??;
+    let down_bytes = right_res.context("raw relay right->left join failure")??;
 
-    Ok(())
+    Ok(RelayStats {
+        up_bytes,
+        down_bytes,
+    })
 }
 
 async fn relay_tcp_over_ws<S>(
@@ -629,7 +701,7 @@ async fn relay_tcp_over_ws<S>(
     ws_stream: WebSocketStream<S>,
     generation: Option<Arc<GenerationState>>,
     chunking: ChunkingConfig,
-) -> Result<()>
+) -> Result<RelayStats>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -639,15 +711,17 @@ where
     let generation_for_up = generation.clone();
     let generation_for_down = generation;
 
-    let mut tcp_to_ws = tokio::spawn(async move {
+    let tcp_to_ws = tokio::spawn(async move {
         let mut buffer = [0u8; 16 * 1024];
         let mut initial_remaining = chunking.initial_bytes;
+        let mut transferred = 0u64;
         loop {
             let read_len = tcp_reader.read(&mut buffer).await?;
             if read_len == 0 {
                 let _ = ws_writer.send(Message::Close(None)).await;
                 break;
             }
+            transferred = transferred.saturating_add(read_len as u64);
 
             if let Some(state) = &generation_for_up {
                 state.add_bytes(read_len as u64);
@@ -661,14 +735,16 @@ where
             )
             .await?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<u64, anyhow::Error>(transferred)
     });
 
-    let mut ws_to_tcp = tokio::spawn(async move {
+    let ws_to_tcp = tokio::spawn(async move {
         let mut initial_remaining = chunking.initial_bytes;
+        let mut transferred = 0u64;
         while let Some(frame) = ws_reader.next().await {
             match frame? {
                 Message::Binary(payload) => {
+                    transferred = transferred.saturating_add(payload.len() as u64);
                     if let Some(state) = &generation_for_down {
                         state.add_bytes(payload.len() as u64);
                     }
@@ -685,21 +761,17 @@ where
                 _ => {}
             }
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<u64, anyhow::Error>(transferred)
     });
 
-    tokio::select! {
-        first = &mut tcp_to_ws => {
-            ws_to_tcp.abort();
-            first.context("tcp->ws task join failure")??;
-        }
-        second = &mut ws_to_tcp => {
-            tcp_to_ws.abort();
-            second.context("ws->tcp task join failure")??;
-        }
-    }
+    let (up_res, down_res) = tokio::join!(tcp_to_ws, ws_to_tcp);
+    let up_bytes = up_res.context("tcp->ws task join failure")??;
+    let down_bytes = down_res.context("ws->tcp task join failure")??;
 
-    Ok(())
+    Ok(RelayStats {
+        up_bytes,
+        down_bytes,
+    })
 }
 
 async fn send_binary_with_chunking<W>(
@@ -777,6 +849,98 @@ where
             .context("failed to write TCP payload")?;
     }
 
+    Ok(())
+}
+
+async fn start_health_server(mode: &'static str, listen: SocketAddr) -> Result<()> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind {mode} health listener on {listen}"))?;
+    println!("{mode} health endpoint ready on http://{listen}/healthz");
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, peer)) => {
+                    tokio::spawn(async move {
+                        if let Err(err) = handle_health_connection(&mut socket, mode).await {
+                            eprintln!(
+                                "{mode} health request from {} failed: {err:#}",
+                                peer
+                            );
+                        }
+                    });
+                }
+                Err(err) => {
+                    eprintln!("{mode} health accept failed: {err:#}");
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn handle_health_connection(socket: &mut TcpStream, mode: &str) -> Result<()> {
+    let mut buffer = [0u8; 1024];
+    let read_len = timeout(Duration::from_secs(3), socket.read(&mut buffer))
+        .await
+        .context("health request timeout")?
+        .context("failed to read health request")?;
+    if read_len == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buffer[..read_len]);
+    let request_line = request.lines().next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or("/");
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (status, body) = match (method, path) {
+        ("GET", "/healthz") | ("GET", "/readyz") => (
+            StatusCode::OK,
+            format!(
+                "{{\"status\":\"ok\",\"mode\":\"{}\",\"unix_time\":{}}}",
+                mode, now
+            ),
+        ),
+        ("GET", "/") => (
+            StatusCode::OK,
+            format!(
+                "{{\"service\":\"aegis-edge-relay\",\"mode\":\"{}\",\"health\":\"/healthz\"}}",
+                mode
+            ),
+        ),
+        ("GET", _) => (StatusCode::NOT_FOUND, String::from("{\"error\":\"not found\"}")),
+        _ => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            String::from("{\"error\":\"method not allowed\"}"),
+        ),
+    };
+
+    let status_code = status.as_u16();
+    let reason = status.canonical_reason().unwrap_or("Unknown");
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code,
+        reason,
+        body.len(),
+        body
+    );
+    socket
+        .write_all(response.as_bytes())
+        .await
+        .context("failed to write health response")?;
+    socket
+        .shutdown()
+        .await
+        .context("failed to shutdown health response socket")?;
     Ok(())
 }
 
