@@ -126,7 +126,6 @@ struct BridgeState {
     rotation: Arc<RotationManager>,
     edge_connect_slots: Arc<Semaphore>,
     edge_candidates: Arc<Vec<SocketAddr>>,
-    next_edge_index: AtomicU64,
 }
 
 struct RotationManager {
@@ -335,7 +334,6 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
         rotation: Arc::new(RotationManager::new(cycle_after, args.cycle_bytes)),
         edge_connect_slots: Arc::new(Semaphore::new(args.max_concurrent_edge_connects.max(1))),
         edge_candidates,
-        next_edge_index: AtomicU64::new(0),
         args,
     });
 
@@ -530,7 +528,7 @@ async fn connect_bridge_websocket(
         }),
     );
 
-    let (ws_stream, _) = timeout(Duration::from_secs(8), client_async(request, tls_stream))
+    let (ws_stream, _) = timeout(Duration::from_secs(15), client_async(request, tls_stream))
         .await
         .context("websocket upgrade to edge timed out")?
         .context("websocket upgrade to edge failed")?;
@@ -554,16 +552,9 @@ async fn connect_bridge_websocket_with_retry(
         .edge_candidates
         .first()
         .expect("bridge must have at least one edge candidate");
-    let extra_candidates: Vec<SocketAddr> = state.edge_candidates.iter().skip(1).copied().collect();
-    let extra_count = extra_candidates.len();
 
     for attempt in 1..=max_attempts {
-        let edge_addr = if attempt == 1 || extra_count == 0 {
-            primary_edge
-        } else {
-            let idx = state.next_edge_index.fetch_add(1, Ordering::Relaxed) as usize % extra_count;
-            extra_candidates[idx]
-        };
+        let edge_addr = primary_edge;
         match connect_bridge_websocket(state, edge_addr).await {
             Ok(stream) => return Ok(stream),
             Err(err) => {
@@ -822,25 +813,7 @@ where
 }
 
 async fn resolve_edge_candidates(args: &BridgeArgs) -> Vec<SocketAddr> {
-    let mut candidates = vec![args.edge_addr];
-    let host_port = (args.host.as_str(), args.edge_addr.port());
-    let prefer_ipv4 = args.edge_addr.is_ipv4();
-
-    if let Ok(resolved) = timeout(Duration::from_secs(3), tokio::net::lookup_host(host_port)).await
-    {
-        if let Ok(addresses) = resolved {
-            for addr in addresses {
-                if addr.is_ipv4() != prefer_ipv4 {
-                    continue;
-                }
-                if !candidates.contains(&addr) {
-                    candidates.push(addr);
-                }
-            }
-        }
-    }
-
-    candidates
+    vec![args.edge_addr]
 }
 
 async fn send_binary_with_chunking<W>(
