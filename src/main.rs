@@ -31,6 +31,7 @@ const PROFILE_HEADER_NAME: &str = "x-traffic-profile";
 const EDGE_INITIAL_SEGMENT_BYTES_DEFAULT: usize = 0;
 const EDGE_INITIAL_SEGMENT_CHUNK_DEFAULT: usize = 3;
 const EDGE_CONNECT_RETRIES: u32 = 3;
+const AUTH_PREFACE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -675,9 +676,9 @@ async fn read_auth_line(stream: &mut TcpStream, max_len: usize) -> Result<String
             return Err(anyhow!("authentication preface is too long"));
         }
         let mut byte = [0u8; 1];
-        let read_len = stream
-            .read(&mut byte)
+        let read_len = timeout(AUTH_PREFACE_READ_TIMEOUT, stream.read(&mut byte))
             .await
+            .context("authentication preface read timed out")?
             .context("failed to read authentication preface")?;
         if read_len == 0 {
             return Err(anyhow!("connection closed before authentication preface"));
