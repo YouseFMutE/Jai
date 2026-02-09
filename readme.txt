@@ -32,7 +32,7 @@ bash -lc 'set -euo pipefail; REPO="https://github.com/YouseFMutE/Jai.git"; APP="
 - --initial-chunk-bytes 0
 - --initial-chunk-size 32
 - --initial-chunk-delay-ms 0
-- --max-concurrent-edge-connects 24
+- --max-concurrent-edge-connects 8
 
 بعد از نصب روی Bridge:
 - sudo systemctl status aegis-edge-relay --no-pager

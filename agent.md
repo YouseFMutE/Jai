@@ -14,7 +14,7 @@ Aegis Edge Relay provides a production-oriented TCP-over-WebSocket transport pat
 ## Transport Profile
 - Protocol stack: `TCP -> TLS 1.3 -> WebSocket -> Binary Frames`.
 - UDP is not used anywhere in the data path.
-- Bridge client uses ALPN advertising for `h2` and `http/1.1`.
+- Bridge client uses ALPN `http/1.1` for WebSocket upgrade compatibility.
 - Worker upstream transport can run with plaintext TCP (`ws`) or TLS (`wss`) toward Exit.
 
 ## Traffic Normalization Profile

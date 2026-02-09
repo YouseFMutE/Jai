@@ -833,7 +833,7 @@ where
     if segmented_len > 0 {
         for piece in data[..segmented_len].chunks(chunking.chunk_size) {
             ws_writer
-                .send(Message::Binary(piece.to_vec().into()))
+                .send(Message::Binary(piece.to_vec()))
                 .await
                 .context("failed to write segmented websocket frame")?;
             if !chunking.chunk_delay.is_zero() {
@@ -845,7 +845,7 @@ where
 
     if segmented_len < data.len() {
         ws_writer
-            .send(Message::Binary(data[segmented_len..].to_vec().into()))
+            .send(Message::Binary(data[segmented_len..].to_vec()))
             .await
             .context("failed to write websocket frame")?;
     }
