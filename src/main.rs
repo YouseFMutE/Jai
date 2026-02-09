@@ -24,8 +24,8 @@ use tokio_tungstenite::{accept_hdr_async, client_async, WebSocketStream};
 
 const AUTH_HEADER_NAME: &str = "auth-secret-key";
 const PROFILE_HEADER_NAME: &str = "x-traffic-profile";
-const EDGE_INITIAL_SEGMENT_BYTES: usize = 300;
-const EDGE_INITIAL_SEGMENT_CHUNK: usize = 3;
+const EDGE_INITIAL_SEGMENT_BYTES_DEFAULT: usize = 0;
+const EDGE_INITIAL_SEGMENT_CHUNK_DEFAULT: usize = 3;
 const EDGE_CONNECT_RETRIES: u32 = 3;
 
 #[derive(Parser, Debug)]
@@ -77,6 +77,10 @@ struct BridgeArgs {
     initial_chunk_size: usize,
     #[arg(long, default_value_t = 2)]
     initial_chunk_delay_ms: u64,
+    #[arg(long, default_value_t = EDGE_INITIAL_SEGMENT_BYTES_DEFAULT)]
+    edge_initial_segment_bytes: usize,
+    #[arg(long, default_value_t = EDGE_INITIAL_SEGMENT_CHUNK_DEFAULT)]
+    edge_initial_segment_chunk: usize,
     #[arg(long)]
     health_listen: Option<SocketAddr>,
 }
@@ -330,12 +334,14 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
     }
 
     println!(
-        "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes)",
+        "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes, edge-segment {}/{}B)",
         state.args.listen,
         state.args.edge_addr,
         state.args.host,
         cycle_minutes,
-        state.args.cycle_bytes
+        state.args.cycle_bytes,
+        state.args.edge_initial_segment_bytes,
+        state.args.edge_initial_segment_chunk
     );
 
     loop {
@@ -466,8 +472,8 @@ async fn connect_bridge_websocket(
         ServerName::try_from(state.args.sni.clone()).context("invalid SNI server name")?;
     let edge_stream = InitialChunkedTcpStream::new(
         edge_stream,
-        EDGE_INITIAL_SEGMENT_BYTES,
-        EDGE_INITIAL_SEGMENT_CHUNK,
+        state.args.edge_initial_segment_bytes,
+        state.args.edge_initial_segment_chunk,
     );
     let tls_stream = state
         .tls_connector
