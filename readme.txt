@@ -28,6 +28,12 @@ bash -lc 'set -euo pipefail; REPO="https://github.com/YouseFMutE/Jai.git"; APP="
 - Auth Secret Key Mode: Generate Random (یا Manual)
 - Target Port: پورتی که کاربر باید بزند (مثلا 1818 یا 443)
 
+اسکریپت Bridge به‌صورت پیش‌فرض این تنظیمات پایداری را اعمال می‌کند:
+- --initial-chunk-bytes 0
+- --initial-chunk-size 32
+- --initial-chunk-delay-ms 0
+- --max-concurrent-edge-connects 24
+
 بعد از نصب روی Bridge:
 - sudo systemctl status aegis-edge-relay --no-pager
 - ss -lntp | grep ':1818'    # یا پورت انتخابی شما

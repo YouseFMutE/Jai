@@ -13,6 +13,7 @@ use rustls::pki_types::ServerName;
 use rustls::{version, ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
@@ -81,6 +82,8 @@ struct BridgeArgs {
     edge_initial_segment_bytes: usize,
     #[arg(long, default_value_t = EDGE_INITIAL_SEGMENT_CHUNK_DEFAULT)]
     edge_initial_segment_chunk: usize,
+    #[arg(long, default_value_t = 24)]
+    max_concurrent_edge_connects: usize,
     #[arg(long)]
     health_listen: Option<SocketAddr>,
 }
@@ -118,6 +121,7 @@ struct BridgeState {
     args: BridgeArgs,
     tls_connector: TlsConnector,
     rotation: Arc<RotationManager>,
+    edge_connect_slots: Arc<Semaphore>,
 }
 
 struct RotationManager {
@@ -326,6 +330,7 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
     let state = Arc::new(BridgeState {
         tls_connector: build_tls_connector(args.traffic_profile)?,
         rotation: Arc::new(RotationManager::new(cycle_after, args.cycle_bytes)),
+        edge_connect_slots: Arc::new(Semaphore::new(args.max_concurrent_edge_connects.max(1))),
         args,
     });
 
@@ -334,14 +339,15 @@ async fn run_bridge_mode(args: BridgeArgs) -> Result<()> {
     }
 
     println!(
-        "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes, edge-segment {}/{}B)",
+        "Bridge mode ready on {} -> edge {} with host {} (rotation {} min / {} bytes, edge-segment {}/{}B, max-edge-connects {})",
         state.args.listen,
         state.args.edge_addr,
         state.args.host,
         cycle_minutes,
         state.args.cycle_bytes,
         state.args.edge_initial_segment_bytes,
-        state.args.edge_initial_segment_chunk
+        state.args.edge_initial_segment_chunk,
+        state.args.max_concurrent_edge_connects
     );
 
     loop {
@@ -517,6 +523,12 @@ async fn connect_bridge_websocket_with_retry(
     state: &BridgeState,
     attempts: u32,
 ) -> Result<WebSocketStream<tokio_rustls::client::TlsStream<InitialChunkedTcpStream>>> {
+    let _edge_slot = state
+        .edge_connect_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .context("failed to acquire edge connect slot")?;
     let max_attempts = attempts.max(1);
     let mut last_error = None;
 
